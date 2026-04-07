@@ -1,0 +1,5 @@
+.venv
+*__pycache__/
+*.pyc
+experiments/*
+load_hmm_composition.sh

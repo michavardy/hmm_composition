@@ -1,0 +1,125 @@
+[log]
+# Set the logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+level = "DEBUG"
+
+[preprocess]
+input_dir = "data/shakespeare-dataset/text"
+file_pattern = "*.txt"
+encoding = "utf-8"
+lowercase = true
+keep_punctuation = ".,?'"
+normalize_whitespace = true
+split_mode = "sentence"
+sentence_split_pattern = "(?<=[.!?])\\s+"
+line_split_pattern = "\\n+"
+token_pattern = "[a-z0-9']+|[.,?]"
+min_sequence_length = 1
+rare_token_cutoff = 5
+max_vocab_size = 10000
+special_tokens = ["<PAD>", "<UNK>"]
+test_size = 0.2
+random_state = 42
+shuffle = true
+numpy_dtype = "int32"
+output_dir = "data/processed"
+train_output = "train_sequences.pkl"
+test_output = "test_sequences.pkl"
+vocab_json_output = "vocab.json"
+vocab_pickle_output = "vocab.pkl"
+metadata_output = "metadata.pkl"
+
+[training]
+processed_dir = "data/processed"
+train_data_file = "train_sequences.pkl"
+test_data_file = "test_sequences.pkl"
+vocab_file = "vocab.pkl"
+experiments_dir = "experiments"
+seed = 42
+wandb_project = "hmm-composition"
+wandb_entity = ""
+wandb_mode = "offline"
+
+[[training.experiments]]
+name = "baseline_n_gram"
+model = "n_gram"
+enabled = true
+max_iteration = 100
+delta_likelyhood = 0.001
+train_subset = 3000
+test_subset = 600
+tags = ["baseline", "n_gram"]
+
+
+
+#[[training.experiments]]
+#name = "baseline_lstm"
+#model = "lstm"
+#enabled = true
+#max_iteration = 1
+#delta_likelyhood = 0.001
+#train_subset = 512
+#test_subset = 128
+#tags = ["baseline", "lstm"]
+#
+#[[training.experiments]]
+#name = "hmm_50"
+#model = "hmm"
+#enabled = true
+#max_iteration = 100
+#delta_likelyhood = 0.001
+#train_subset = 3000
+#test_subset = 600
+#tags = ["baseline", "hmm", "50_states"]
+
+[model_hmm]
+states = 50
+pseudocount = 0.001
+random_seed = 42
+
+[model_chmm]
+types = 2
+states = 3
+pseudocount = 0.001
+random_seed = 42
+
+[model_fhmm]
+chains = 2
+states = 2
+pseudocount = 0.001
+random_seed = 42
+
+[model_f_hmm]
+memory_window = 1
+states = 3
+pseudocount = 0.001
+random_seed = 42
+
+[model_switching_hmm]
+modes = 2
+states = 3
+pseudocount = 0.001
+random_seed = 42
+
+[model_lstm]
+layers = 1
+nodes = 64
+embedding_dim = 64
+learning_rate = 0.001
+epochs = 2
+dropout = 0.0
+bos_token_id = 0
+device = "cpu"
+
+[model_n_gram]
+k = 3
+discount = 0.75
+bos_token_id = 0
+
+[dashboard]
+host = "127.0.0.1"
+port = 8766
+port_search_limit = 20
+experiments_dir = "experiments"
+title = "HMM Composition Experiments"
+open_browser = true
+open_browser_delay_seconds = 0.5
