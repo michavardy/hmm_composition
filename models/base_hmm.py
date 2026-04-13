@@ -1,256 +1,293 @@
-from __future__ import annotations
-
-import math
-from collections.abc import Iterable
-from typing import Any
-
+from sympy import sequence
+import torch
+import torch.nn.functional as F
+from models.base_initializer import (
+    ZerosInitializer,
+    RandomInitializer,
+    SmallRandomInitializer,
+    InitializerType,
+)
 import numpy as np
-
-from utils.models import Dataset, SequenceModel
-from utils.recursive import solve_recursive
-
-
-def logsumexp(values: np.ndarray, axis: int | None = None, keepdims: bool = False) -> np.ndarray:
-    max_values = np.max(values, axis=axis, keepdims=True)
-    stable = np.exp(values - max_values)
-    summed = np.log(np.sum(stable, axis=axis, keepdims=True)) + max_values
-    if keepdims:
-        return summed
-    if axis is None:
-        return np.asarray(summed).reshape(())
-    return np.squeeze(summed, axis=axis)
+#from pipelines.train import load_config, load_processed_artifacts
+import random
+from utils.decorators import log_time_and_memory
+from utils.setup_logger import get_logger
 
 
-class BaseHMMModel(SequenceModel):
-    def __init__(self, vocab_size: int, num_states: int, config: dict[str, Any] | None = None):
-        super().__init__(vocab_size=vocab_size, config=config)
+logger = get_logger("base_hmm")
+
+
+class BaseHMMModel:
+    def __init__(
+        self,
+        vocab_size: int,
+        num_states: int,
+        initial_initializer: InitializerType = ZerosInitializer(),
+        transition_initializer: InitializerType = ZerosInitializer(),
+        emission_initializer: InitializerType = ZerosInitializer(),
+        device="cpu",
+    ):
+        self.vocab_size = int(vocab_size)
         self.num_states = int(num_states)
-        self.random_seed = int(self.config.get("random_seed", 42))
-        self.pseudocount = float(self.config.get("pseudocount", 1e-3))
-        self.rng = np.random.default_rng(self.random_seed)
-        self.initial_probs = self._normalize(self.rng.random(self.num_states) + self.pseudocount)
-        self.transition_probs = self._normalize_rows(
-            self.rng.random((self.num_states, self.num_states)) + self.pseudocount
-        )
-        self.emission_probs = self._normalize_rows(
-            self.rng.random((self.num_states, self.vocab_size)) + self.pseudocount
+        self.device = device
+        self.initialize(
+            initial_initializer, transition_initializer, emission_initializer
         )
 
-    def _normalize(self, values: np.ndarray) -> np.ndarray:
-        total = np.sum(values)
-        if total <= 0:
-            return np.full_like(values, 1.0 / len(values), dtype=np.float64)
-        return values / total
-
-    def _normalize_rows(self, matrix: np.ndarray) -> np.ndarray:
-        row_sums = matrix.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0
-        return matrix / row_sums
+    def initialize(
+        self, initial_initializer, transition_initializer, emission_initializer
+    ):
+        self.initial_logits = initial_initializer(
+            (self.num_states,), device=self.device
+        )
+        self.transition_logits = transition_initializer(
+            (self.num_states, self.num_states), device=self.device
+        )
+        self.emission_logits = emission_initializer(
+            (self.num_states, self.vocab_size), device=self.device
+        )
 
     @property
-    def log_initial_probs(self) -> np.ndarray:
-        return np.log(np.clip(self.initial_probs, 1e-12, None))
+    def log_initial_probs(self):
+        return F.log_softmax(self.initial_logits, dim=0)  # (K,)
 
     @property
-    def log_transition_probs(self) -> np.ndarray:
-        return np.log(np.clip(self.transition_probs, 1e-12, None))
+    def log_transition_probs(self):
+        return F.log_softmax(self.transition_logits, dim=1)  # (K, K)
 
     @property
-    def log_emission_probs(self) -> np.ndarray:
-        return np.log(np.clip(self.emission_probs, 1e-12, None))
-
-    def _emission_log_table(
-        self,
-        sequence: np.ndarray,
-        mask_index: int | None = None,
-    ) -> np.ndarray:
-        table = self.log_emission_probs[:, sequence].T
-        if mask_index is not None:
-            table[mask_index] = 0.0
-        return table
-
-    def _forward(self, emission_log_table: np.ndarray) -> np.ndarray:
-        def initialize_row(_: np.ndarray, row_index: int) -> np.ndarray:
-            return self.log_initial_probs + emission_log_table[row_index]
-
-        def update_row(table: np.ndarray, row_index: int) -> np.ndarray:
-            previous_row = table[row_index - 1][:, None] + self.log_transition_probs
-            return logsumexp(previous_row, axis=0) + emission_log_table[row_index]
-
-        return solve_recursive(
-            len(emission_log_table),
-            (self.num_states,),
-            initialize_row,
-            update_row,
-            dtype=np.float64,
-            fill_value=-np.inf,
+    def log_emission_probs(self):
+        return F.log_softmax(self.emission_logits, dim=1)  # (K, V)
+    
+    def _forward(self, sequence: torch.Tensor) -> torch.Tensor:
+        alpha = torch.zeros((len(sequence), self.num_states), device=self.device)
+        alpha[0] = self.log_initial_probs + self.log_emission_probs[:, sequence[0]]
+        for t in range(1, len(sequence)):
+            prev_alpha = alpha[t-1]
+            scores = prev_alpha.unsqueeze(1) + self.log_transition_probs
+            alpha[t] = torch.logsumexp(scores, dim=0) + self.log_emission_probs[:, sequence[t]]
+        return alpha
+    
+    def _backward(self, sequence: torch.Tensor) -> torch.Tensor:
+        beta = torch.zeros((len(sequence), self.num_states), device=self.device)
+        for t in reversed(range(len(sequence) - 1)):
+            next_beta = beta[t+1]
+            scores = self.log_transition_probs + self.log_emission_probs[:, sequence[t+1]] + next_beta
+            beta[t] = torch.logsumexp(scores, dim=1)
+        return beta
+            
+    def _compute_gamma(self, alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        log_gamma = alpha + beta
+        log_gamma -= torch.logsumexp(log_gamma, dim=1, keepdim=True)
+        return log_gamma
+    
+    def _compute_xi(self, sequence, alpha, beta):
+        log_xi = torch.zeros(
+            (len(sequence) - 1, self.num_states, self.num_states),
+            device=self.device
         )
-
-    def _backward(self, emission_log_table: np.ndarray) -> np.ndarray:
-        def initialize_row(_: np.ndarray, __: int) -> np.ndarray:
-            return np.zeros(self.num_states, dtype=np.float64)
-
-        def update_row(table: np.ndarray, row_index: int) -> np.ndarray:
-            next_row = emission_log_table[row_index + 1] + table[row_index + 1]
-            return logsumexp(self.log_transition_probs + next_row[None, :], axis=1)
-
-        return solve_recursive(
-            len(emission_log_table),
-            (self.num_states,),
-            initialize_row,
-            update_row,
-            dtype=np.float64,
-            fill_value=0.0,
-            reverse=True,
-        )
-
-    def _forward_backward(
-        self,
-        sequence: np.ndarray,
-        mask_index: int | None = None,
-    ) -> dict[str, np.ndarray | float]:
-        emission_log_table = self._emission_log_table(sequence, mask_index=mask_index)
-        alpha = self._forward(emission_log_table)
-        beta = self._backward(emission_log_table)
-        log_likelihood = float(logsumexp(alpha[-1], axis=0))
-        gamma = alpha + beta - log_likelihood
-
-        xi = np.zeros((max(len(sequence) - 1, 0), self.num_states, self.num_states), dtype=np.float64)
-        for time_index in range(len(sequence) - 1):
-            xi[time_index] = (
-                alpha[time_index][:, None]
+        
+        for t in range(len(sequence) - 1):
+            scores = (
+                alpha[t].unsqueeze(1)
                 + self.log_transition_probs
-                + emission_log_table[time_index + 1][None, :]
-                + beta[time_index + 1][None, :]
-                - log_likelihood
+                + self.log_emission_probs[:, sequence[t+1]]
+                + beta[t+1]
             )
+            
+            log_norm = torch.logsumexp(scores.flatten(), dim=0)
+            log_xi[t] = scores - log_norm  # stay in log-space
+    
+        return log_xi
+    
+    def _sanity_check(self, log_posteriors, atol=1e-2):
+        for idx, post in enumerate(log_posteriors):
+            gamma = torch.exp(post['log_gamma'])  # (T, K)
+            xi = torch.exp(post['log_xi'])       # (T-1, K, K)
+            # Check gamma sums to 1 per timestep
+            assert torch.allclose(gamma.sum(dim=1), torch.ones_like(gamma[:, 0]), atol=atol), f"[Gamma FAIL] sequence {idx}"
+            # Check xi sums to 1 per timestep
+            assert torch.allclose(xi.sum(dim=(1, 2)), torch.ones_like(xi[:, 0, 0]), atol=atol), f"[Xi FAIL] sequence {idx}"
+            # Optional: check xi row sums match gamma[:-1]
+            assert torch.allclose(xi.sum(dim=2), gamma[:-1], atol=atol), f"[Xi-Gamma consistency FAIL] sequence {idx}"
+    
+    def _calculate_initial_prob_distribution(self, log_posteriors: list[dict[str,torch.Tensor]]) -> None:
+        gamma_0 = torch.stack([post['log_gamma'][0] for post in log_posteriors], dim=0)
+        log_initial_probs = torch.logsumexp(gamma_0, dim=0) - np.log(len(log_posteriors))
+        self.initial_logits.data = log_initial_probs  # you can assign logits directly
+        # sanity check
+        init_sum = torch.exp(self.initial_logits).sum()
+        assert torch.allclose(init_sum, torch.tensor(1.0, device=self.device), atol=1e-4), f"Initial probs do not sum to 1: {init_sum}"
+        
+    def _calculate_transition_prob_distribution(self, log_posteriors: list[dict[str,torch.Tensor]]) -> None:
+        sum_xi = torch.zeros((self.num_states, self.num_states), device=self.device)
+        sum_gamma = torch.zeros((self.num_states,), device=self.device)
+        for post in log_posteriors:
+            xi = torch.exp(post['log_xi'])  # (T-1, K, K)
+            gamma = torch.exp(post['log_gamma'])  # (T, K)
+            sum_xi += xi.sum(dim=0)             # sum over time
+            sum_gamma += gamma[:-1].sum(dim=0)  # sum over time excluding last
+        # convert to log-space for logits
+        self.transition_logits.data = torch.log(sum_xi / sum_gamma.unsqueeze(1))
+        # sanity check
+        trans_sum = torch.exp(self.transition_logits).sum(dim=1)
+        assert torch.allclose(trans_sum, torch.ones_like(trans_sum), atol=1e-4), f"Transition rows do not sum to 1: {trans_sum}"
+        
+    def _calculate_emission_prob_distribution(self, data: list[torch.Tensor], log_posteriors: list[dict[str,torch.Tensor]]) -> None:
+        sum_gamma_obs = torch.zeros((self.num_states, self.vocab_size), device=self.device)
+        sum_gamma_total = torch.zeros((self.num_states,), device=self.device)
+        
+        for seq, post in zip(data, log_posteriors):
+            gamma = torch.exp(post['log_gamma'])  # (T, K)
+            for t, obs in enumerate(seq):
+                sum_gamma_obs[:, obs] += gamma[t]
+            sum_gamma_total += gamma.sum(dim=0)
+        
+        self.emission_logits.data = torch.log(sum_gamma_obs / sum_gamma_total.unsqueeze(1))
+        # sanity check
+        emiss_sum = torch.exp(self.emission_logits).sum(dim=1)
+        assert torch.allclose(emiss_sum, torch.ones_like(emiss_sum), atol=1e-4), f"Emission rows do not sum to 1: {emiss_sum}"
 
-        return {
-            "alpha": alpha,
-            "beta": beta,
-            "gamma": gamma,
-            "xi": xi,
-            "log_likelihood": log_likelihood,
-        }
+    def _m_step(self, data: list[torch.Tensor], log_posteriors: list[dict[str,torch.Tensor]]) -> None:
+        self._calculate_initial_prob_distribution(log_posteriors)
+        self._calculate_transition_prob_distribution(log_posteriors)
+        self._calculate_emission_prob_distribution(data, log_posteriors)
 
-    def fit(
-        self,
-        data: Dataset,
-        max_iteration: int,
-        delta_likelyhood: float,
-    ) -> BaseHMMModel:
-        previous_log_likelihood: float | None = None
-        cleaned_data = [np.asarray(sequence, dtype=np.int64) for sequence in data if len(sequence) > 0]
-        if not cleaned_data:
-            raise ValueError("Training data is empty")
-
+    @log_time_and_memory(logger)
+    def _e_step(self, data: list[torch.Tensor]) -> list[dict[str,torch.Tensor]]:
+        log_posteriors = []
+        for seq in data:
+            seq_post = {}
+            seq_post['log_alpha'] = self._forward(seq)
+            seq_post['log_beta'] = self._backward(seq)
+            seq_post['log_gamma'] = self._compute_gamma(seq_post['log_alpha'], seq_post['log_beta'])
+            seq_post['log_xi'] = self._compute_xi(seq, seq_post['log_alpha'], seq_post['log_beta'])
+            log_posteriors.append(seq_post)
+        self._sanity_check(log_posteriors)
+        return log_posteriors
+    
+    def _exit_condition(self, iteration: int, prev_log_likelihood: float | None, new_log_likelihood: float, delta_likelyhood: float) -> bool:
+        if prev_log_likelihood is None:
+            return False
+        exit =  abs(new_log_likelihood - prev_log_likelihood) < delta_likelyhood
+        if exit:
+            logger.info(f"Converged at iteration {iteration} with delta {abs(new_log_likelihood - prev_log_likelihood)}")
+        return exit
+    
+    def fit(self, data: list[np.array], max_iteration: int, delta_likelyhood: float):
+        logger.info(f"Starting EM training for max {max_iteration} iterations with delta {delta_likelyhood}")
+        prev_log_likelihood: float | None = None
+        cleaned_data = [
+            seq.detach().clone().to(dtype=torch.long, device=self.device) if isinstance(seq, torch.Tensor) 
+            else torch.tensor(seq, dtype=torch.long, device=self.device)
+            for seq in data
+        ]
         for iteration in range(int(max_iteration)):
-            initial_counts = np.full(self.num_states, self.pseudocount, dtype=np.float64)
-            transition_counts = np.full(
-                (self.num_states, self.num_states),
-                self.pseudocount,
-                dtype=np.float64,
-            )
-            emission_counts = np.full(
-                (self.num_states, self.vocab_size),
-                self.pseudocount,
-                dtype=np.float64,
-            )
-            total_log_likelihood = 0.0
+            log_posteriors = self._e_step(cleaned_data)
+            self._m_step(cleaned_data, log_posteriors)
+            new_log_likelihood = self.log_likelihood(cleaned_data)
+            if self._exit_condition(iteration, prev_log_likelihood, new_log_likelihood, delta_likelyhood):
+                break
+            prev_log_likelihood = new_log_likelihood
+    
+    def emission_logprob_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
+        """
+        Returns log P(sequence | HMM) for each time step (sum over states)
+        """
+        alpha = self._forward(sequence)  # (T, K)
+        log_probs = torch.logsumexp(alpha, dim=1)  # (T,)
+        return log_probs
+    
+    def log_likelihood(self, data: list[torch.Tensor]) -> float:
+        """
+        Computes total log-likelihood of the dataset under current parameters.
+        """
+        total_log_lik = 0.0
+        for seq in data:
+            alpha = self._forward(seq)          # (T, K)
+            seq_log_lik = torch.logsumexp(alpha[-1], dim=0)  # sum over final states
+            total_log_lik += seq_log_lik.item()  # convert to float
+        return total_log_lik
+    
+    def predict_missing(self, sequence: list[int], mask_index: int) -> int:
+        """
+        Predict the missing symbol at mask_index in sequence.
+        sequence: list of integers (word indices)
+        mask_index: int, position of missing observation
+        Returns: predicted index
+        """
+        seq = torch.tensor(sequence, dtype=torch.long, device=self.device)
+        T = len(seq)
+        
+        # Forward pass up to mask_index
+        alpha = torch.zeros((T, self.num_states), device=self.device)
+        alpha[0] = self.log_initial_probs + self.log_emission_probs[:, seq[0]]
+        for t in range(1, T):
+            if t == mask_index:
+                # Skip using the true observation at mask_index
+                # Use logsumexp over previous + transition only
+                prev_alpha = alpha[t-1]
+                scores = prev_alpha.unsqueeze(1) + self.log_transition_probs
+                alpha[t] = torch.logsumexp(scores, dim=0)
+            else:
+                prev_alpha = alpha[t-1]
+                scores = prev_alpha.unsqueeze(1) + self.log_transition_probs
+                alpha[t] = torch.logsumexp(scores, dim=0) + self.log_emission_probs[:, seq[t]]
+        
+        # Backward pass from mask_index
+        beta = torch.zeros((T, self.num_states), device=self.device)
+        for t in reversed(range(T-1)):
+            if t == mask_index:
+                next_beta = beta[t+1]
+                scores = self.log_transition_probs + next_beta
+                beta[t] = torch.logsumexp(scores, dim=1)
+            else:
+                next_beta = beta[t+1]
+                scores = self.log_transition_probs + self.log_emission_probs[:, seq[t+1]] + next_beta
+                beta[t] = torch.logsumexp(scores, dim=1)
+        
+        # Compute posterior for missing index
+        log_gamma = alpha[mask_index] + beta[mask_index]  # (num_states,)
+        
+        # Now compute likelihood of each possible symbol
+        vocab_post = []
+        for v in range(self.vocab_size):
+            log_emit = self.log_emission_probs[:, v]
+            vocab_post.append(torch.logsumexp(alpha[mask_index-1].unsqueeze(1) + self.log_transition_probs + log_emit + beta[mask_index], dim=0))
+        
+        vocab_post = torch.stack(vocab_post)  # (V,)
+        predicted_index = torch.argmax(vocab_post).item()
+        return predicted_index
+    
+    def perplexity(self, dataset: list[list[int]]) -> float:
+        """
+        Computes perplexity of the dataset under current HMM parameters.
+        dataset: list of sequences (list of indices)
+        """
+        total_tokens = 0
+        total_log_lik = 0.0
+        
+        for seq in dataset:
+            seq_tensor = torch.tensor(seq, dtype=torch.long, device=self.device)
+            total_tokens += len(seq)
+            alpha = self._forward(seq_tensor)
+            seq_log_lik = torch.logsumexp(alpha[-1], dim=0).item()
+            total_log_lik += seq_log_lik
+        
+        avg_log_lik = total_log_lik / total_tokens
+        ppl = np.exp(-avg_log_lik)
+        return ppl
 
-            for sequence in cleaned_data:
-                posteriors = self._forward_backward(sequence)
-                gamma = np.exp(posteriors["gamma"])
-                xi = np.exp(posteriors["xi"])
-                total_log_likelihood += float(posteriors["log_likelihood"])
-
-                initial_counts += gamma[0]
-                if len(sequence) > 1:
-                    transition_counts += xi.sum(axis=0)
-                for time_index, token_id in enumerate(sequence):
-                    emission_counts[:, token_id] += gamma[time_index]
-
-            self.initial_probs = self._normalize(initial_counts)
-            self.transition_probs = self._normalize_rows(transition_counts)
-            self.emission_probs = self._normalize_rows(emission_counts)
-            mean_log_likelihood = total_log_likelihood / len(cleaned_data)
-            self.training_history.append(
-                {
-                    "iteration": float(iteration + 1),
-                    "log_likelihood": float(total_log_likelihood),
-                    "mean_log_likelihood": float(mean_log_likelihood),
-                }
-            )
-
-            if previous_log_likelihood is not None:
-                improvement = abs(total_log_likelihood - previous_log_likelihood)
-                if improvement <= float(delta_likelyhood):
-                    break
-            previous_log_likelihood = total_log_likelihood
-
-        return self
-
-    def likelihood(self, sequence: np.ndarray) -> float:
-        result = self._forward_backward(np.asarray(sequence, dtype=np.int64))
-        return float(result["log_likelihood"])
-
-    def predict_missing(self, sequence: np.ndarray, mask_index: int) -> int:
-        numeric_sequence = np.asarray(sequence, dtype=np.int64)
-        if mask_index < 0 or mask_index >= len(numeric_sequence):
-            raise IndexError("mask_index is out of bounds")
-
-        posteriors = self._forward_backward(numeric_sequence, mask_index=mask_index)
-        state_log_weights = posteriors["alpha"][mask_index] + posteriors["beta"][mask_index]
-        state_log_weights = state_log_weights - logsumexp(state_log_weights, axis=0)
-        token_probs = np.exp(state_log_weights) @ self.emission_probs
-        return int(np.argmax(token_probs))
-
-    def perplexity(self, dataset: Dataset) -> float:
-        cleaned_data = [np.asarray(sequence, dtype=np.int64) for sequence in dataset if len(sequence) > 0]
-        if not cleaned_data:
-            return math.inf
-
-        total_log_likelihood = float(sum(self.likelihood(sequence) for sequence in cleaned_data))
-        total_tokens = sum(len(sequence) for sequence in cleaned_data)
-        if total_tokens == 0:
-            return math.inf
-        return float(math.exp(-total_log_likelihood / total_tokens))
-
-    def decode_states(self, sequence: np.ndarray) -> list[int]:
-        numeric_sequence = np.asarray(sequence, dtype=np.int64)
-        if len(numeric_sequence) == 0:
-            return []
-
-        emission_log_table = self._emission_log_table(numeric_sequence)
-        backpointers = np.zeros((len(numeric_sequence), self.num_states), dtype=np.int64)
-
-        def initialize_row(_: np.ndarray, row_index: int) -> np.ndarray:
-            return self.log_initial_probs + emission_log_table[row_index]
-
-        def update_row(table: np.ndarray, row_index: int) -> np.ndarray:
-            scores = table[row_index - 1][:, None] + self.log_transition_probs
-            backpointers[row_index] = np.argmax(scores, axis=0)
-            return np.max(scores, axis=0) + emission_log_table[row_index]
-
-        viterbi_table = solve_recursive(
-            len(numeric_sequence),
-            (self.num_states,),
-            initialize_row,
-            update_row,
-            dtype=np.float64,
-            fill_value=-np.inf,
-        )
-        state = int(np.argmax(viterbi_table[-1]))
-        decoded = [state]
-        for row_index in range(len(numeric_sequence) - 1, 0, -1):
-            state = int(backpointers[row_index, state])
-            decoded.append(state)
-        decoded.reverse()
-        return decoded
-
-
-def expanded_state_count(*dimensions: int) -> int:
-    count = 1
-    for dimension in dimensions:
-        count *= int(dimension)
-    return count
+if __name__ == "__main__":
+    pass
+    
+    #config = load_config()
+    #train_data, test_data, vocab = load_processed_artifacts(config["training"])
+    #hmm = BaseHMMModel(vocab_size=len(vocab["word_to_id"]), num_states=50)
+    #train_data = random.sample(train_data, 6000)
+    #hmm.fit(train_data, max_iteration=100, delta_likelyhood=1e-3)
+    #sentence = ["to", "be", "or", "not", "to"]
+    #index_list = [vocab["word_to_id"].get(word, vocab["word_to_id"]["<UNK>"]) for word in sentence]
+    #missing_index = hmm.predict_missing(index_list, mask_index=4)  
+    #missing_word = vocab["id_to_word"].get(str(missing_index), "<UNK>") 
+    #breakpoint()

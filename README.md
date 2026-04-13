@@ -99,6 +99,18 @@ python pipelines/train.py
 
 Training creates a new run directory under `experiments/` for each enabled experiment.
 
+If you want to train one model directly from processed artifacts without running every enabled experiment, use:
+
+```bash
+python scripts/train_model.py base_hmm
+```
+
+`base_hmm` is accepted as an alias for the standard `hmm` implementation. You can also override common settings per run:
+
+```bash
+python scripts/train_model.py hmm --name hmm_quick --train-subset 3000 --test-subset 600 --max-iteration 50
+```
+
 ### 4. Open the Dashboard
 
 ```bash

@@ -24,6 +24,12 @@ except ImportError:  # pragma: no cover - dependency guard
 logger = get_logger("TRAIN")
 CONFIG_PATH = ROOT_DIR / "utils" / "config.toml"
 
+MODEL_NAME_ALIASES = {
+    "base_hmm": "hmm",
+    "base-hmm": "hmm",
+    "ngram": "n_gram",
+}
+
 
 def load_config() -> dict[str, Any]:
     with CONFIG_PATH.open("rb") as config_file:
@@ -67,7 +73,13 @@ def limit_dataset(dataset: Dataset, limit: int) -> Dataset:
     return dataset[:limit]
 
 
+def normalize_model_name(model_name: str) -> str:
+    normalized = model_name.strip().lower()
+    return MODEL_NAME_ALIASES.get(normalized, normalized)
+
+
 def model_section_name(model_name: str) -> str:
+    model_name = normalize_model_name(model_name)
     if model_name == "n_gram":
         return "model_n_gram"
     if model_name == "f_hmm":
@@ -76,15 +88,76 @@ def model_section_name(model_name: str) -> str:
 
 
 def merged_experiment_config(config: dict[str, Any], experiment: dict[str, Any]) -> dict[str, Any]:
-    model_name = experiment["model"]
+    model_name = normalize_model_name(experiment["model"])
     merged = {key: value for key, value in config["training"].items() if key != "experiments"}
     merged.update(config.get(model_section_name(model_name), {}))
     merged.update(experiment)
     merged["model_name"] = model_name
+    merged["model"] = model_name
     return merged
 
 
+def build_single_experiment(
+    config: dict[str, Any],
+    model_name: str,
+    *,
+    name: str | None = None,
+    max_iteration: int | None = None,
+    delta_likelyhood: float | None = None,
+    train_subset: int | None = None,
+    test_subset: int | None = None,
+    tags: list[str] | None = None,
+    wandb_mode: str | None = None,
+) -> dict[str, Any]:
+    normalized_model_name = normalize_model_name(model_name)
+    configured_experiments = config.get("training", {}).get("experiments", [])
+    matching_experiment = next(
+        (
+            experiment
+            for experiment in configured_experiments
+            if normalize_model_name(str(experiment.get("model", ""))) == normalized_model_name
+        ),
+        None,
+    )
+
+    experiment: dict[str, Any] = dict(matching_experiment or {})
+    experiment["model"] = normalized_model_name
+    experiment["enabled"] = True
+    experiment["name"] = name or str(experiment.get("name") or f"manual_{normalized_model_name}")
+
+    if max_iteration is not None:
+        experiment["max_iteration"] = max_iteration
+    elif "max_iteration" not in experiment:
+        experiment["max_iteration"] = 30
+
+    if delta_likelyhood is not None:
+        experiment["delta_likelyhood"] = delta_likelyhood
+    elif "delta_likelyhood" not in experiment:
+        experiment["delta_likelyhood"] = 1e-3
+
+    if train_subset is not None:
+        experiment["train_subset"] = train_subset
+    elif "train_subset" not in experiment:
+        experiment["train_subset"] = 0
+
+    if test_subset is not None:
+        experiment["test_subset"] = test_subset
+    elif "test_subset" not in experiment:
+        experiment["test_subset"] = 0
+
+    if tags is not None:
+        experiment["tags"] = tags
+    elif "tags" not in experiment:
+        experiment["tags"] = [normalized_model_name, "manual"]
+
+    if wandb_mode is not None:
+        experiment["wandb_mode"] = wandb_mode
+
+    return experiment
+
+
 def build_model(model_name: str, vocab_size: int, experiment_config: dict[str, Any]):
+    model_name = normalize_model_name(model_name)
     model_cls = MODEL_REGISTRY.get(model_name)
     if model_cls is None:
         raise ValueError(f"Unsupported model '{model_name}'")
@@ -219,6 +292,34 @@ def run_training() -> list[dict[str, Any]]:
         results.append(run_experiment(train_data, test_data, vocab, config, experiment))
 
     return results
+
+
+def run_single_model(
+    model_name: str,
+    *,
+    name: str | None = None,
+    max_iteration: int | None = None,
+    delta_likelyhood: float | None = None,
+    train_subset: int | None = None,
+    test_subset: int | None = None,
+    tags: list[str] | None = None,
+    wandb_mode: str | None = None,
+) -> dict[str, Any]:
+    config = load_config()
+    training_config = config.get("training", {})
+    train_data, test_data, vocab = load_processed_artifacts(training_config)
+    experiment = build_single_experiment(
+        config,
+        model_name,
+        name=name,
+        max_iteration=max_iteration,
+        delta_likelyhood=delta_likelyhood,
+        train_subset=train_subset,
+        test_subset=test_subset,
+        tags=tags,
+        wandb_mode=wandb_mode,
+    )
+    return run_experiment(train_data, test_data, vocab, config, experiment)
 
 
 if __name__ == "__main__":
