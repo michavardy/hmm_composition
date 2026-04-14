@@ -172,6 +172,12 @@ class FractionalHMM(BaseHMMModel):
         log_vocab_scores = torch.logsumexp(log_vocab_scores, dim=0)  # [V]
         return torch.argmax(log_vocab_scores).item()
 
+    def _get_metadata(self) -> dict:
+        metadata = super()._get_metadata()
+        metadata["memory_window"] = self.memory_window
+        metadata["d"] = self.d
+        return metadata
+
     def perplexity(self, dataset: list[list[int]]) -> float:
         total_tokens = 0
         total_ll = 0.0

@@ -4,10 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from models.base_hmm import BaseHMMModel
-from models.base_initializer import (
-    ZerosInitializer,
-    InitializerType,
-)
+from models.base_initializer import initializer_mapping
 from utils.setup_logger import get_logger
 
 logger = get_logger("hierarchical_hmm")
@@ -36,9 +33,9 @@ class HierarchicalHMM(BaseHMMModel):
         num_states: int,
         num_productions: int = 3,
         device: str = "cpu",
-        initial_initializer: InitializerType = ZerosInitializer(),
-        transition_initializer: InitializerType = ZerosInitializer(),
-        emission_initializer: InitializerType = ZerosInitializer(),
+        initial_initializer: BaseHMMModel.InitializerName = "zeros",
+        transition_initializer: BaseHMMModel.InitializerName = "zeros",
+        emission_initializer: BaseHMMModel.InitializerName = "zeros",
     ):
         self.num_productions = num_productions  # D (top-level states)
         self.sub_states = num_states             # K (states per sub-HMM)
@@ -192,6 +189,12 @@ class HierarchicalHMM(BaseHMMModel):
         emiss_sum = torch.exp(self.emission_logits).sum(dim=2)
         assert torch.allclose(emiss_sum, torch.ones_like(emiss_sum), atol=1e-4), \
             f"Emission rows do not sum to 1: {emiss_sum}"
+
+    def _get_metadata(self) -> dict:
+        metadata = super()._get_metadata()
+        metadata["num_productions"] = self.num_productions
+        metadata["sub_states"] = self.sub_states
+        return metadata
 
     # _m_step, fit, _exit_condition, log_likelihood, predict_missing, perplexity
     # all inherited from BaseHMMModel

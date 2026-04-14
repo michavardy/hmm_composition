@@ -90,12 +90,13 @@ model_map = {
     "coupled_hmm": get_coupled_hmm_model,
 }
 
-def main(args: argparse.Namespace) -> tuple[ModelType, dict]:
+def train_model(args: argparse.Namespace) -> tuple[ModelType, dict]:
     config = load_config()
     train_data, test_data, vocab = load_processed_artifacts(config["training"])
     train_data = random.sample(train_data, 6000)
     model = model_map[args.model](args, vocab)  
     model.fit(train_data, max_iteration=2, delta_likelyhood=1e-3)
+    model.dump()
     return model, vocab
 
 def test_model(model, vocab):
@@ -108,5 +109,5 @@ def test_model(model, vocab):
 
 if __name__ == "__main__":
     args = get_cli_args()
-    model, vocab = main(args)
+    model, vocab = train_model(args)
     test_model(model, vocab)

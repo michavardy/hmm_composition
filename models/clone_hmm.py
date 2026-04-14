@@ -4,10 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from models.base_hmm import BaseHMMModel
-from models.base_initializer import (
-    ZerosInitializer,
-    InitializerType,
-)
+from models.base_initializer import initializer_mapping
 from utils.setup_logger import get_logger
 
 logger = get_logger("clone_hmm")
@@ -30,9 +27,9 @@ class CloneHMM(BaseHMMModel):
         num_states: int,
         num_clones: int = 2,
         device: str = "cpu",
-        initial_initializer: InitializerType = ZerosInitializer(),
-        transition_initializer: InitializerType = ZerosInitializer(),
-        emission_initializer: InitializerType = ZerosInitializer(),
+        initial_initializer: BaseHMMModel.InitializerName = "zeros",
+        transition_initializer: BaseHMMModel.InitializerName = "zeros",
+        emission_initializer: BaseHMMModel.InitializerName = "zeros",
     ):
         self.base_states = num_states
         self.num_clones = num_clones
@@ -46,7 +43,7 @@ class CloneHMM(BaseHMMModel):
             device=device,
         )
         # Override emission_logits to be [base_states, V] (shared across clones)
-        self.emission_logits = emission_initializer(
+        self.emission_logits = initializer_mapping[emission_initializer](
             (self.base_states, self.vocab_size), device=self.device
         )
 
@@ -78,6 +75,12 @@ class CloneHMM(BaseHMMModel):
         emiss_sum = torch.exp(self.emission_logits).sum(dim=1)
         assert torch.allclose(emiss_sum, torch.ones_like(emiss_sum), atol=1e-4), \
             f"Emission rows do not sum to 1: {emiss_sum}"
+
+    def _get_metadata(self) -> dict:
+        metadata = super()._get_metadata()
+        metadata["num_clones"] = self.num_clones
+        metadata["base_states"] = self.base_states
+        return metadata
 
     # Everything else inherited from BaseHMMModel:
     # _forward, _backward, _compute_gamma, _compute_xi,

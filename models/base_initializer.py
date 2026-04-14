@@ -52,3 +52,11 @@ class SmallRandomInitializer(BaseInitializer):
         return 0.01 * torch.randn(shape, device=device)
     
 InitializerType = ZerosInitializer | RandomInitializer | SmallRandomInitializer | StickyInitializer | StickyNoisyInitializer
+
+initializer_mapping = {
+    "zeros": ZerosInitializer(),
+    "random": RandomInitializer(),
+    "small_random": SmallRandomInitializer(),
+    "sticky": StickyInitializer(),
+    "sticky_noisy": StickyNoisyInitializer(),
+}

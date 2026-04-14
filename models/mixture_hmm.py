@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
+import pickle
+import random
+import string
+import time
+from pathlib import Path
+
 import numpy as np
 import torch
 from models.base_hmm import BaseHMMModel
-from models.base_initializer import (
-    ZerosInitializer,
-    InitializerType,
-)
+from utils.constants import trained_model_path, trained_model_metadata_path
 from utils.setup_logger import get_logger
 
 logger = get_logger("mixture_hmm")
@@ -35,14 +39,20 @@ class MixtureHMM:
         num_components: int,
         num_states: int,
         device: str = "cpu",
-        initial_initializer: InitializerType = ZerosInitializer(),
-        transition_initializer: InitializerType = ZerosInitializer(),
-        emission_initializer: InitializerType = ZerosInitializer(),
+        initial_initializer: BaseHMMModel.InitializerName = "zeros",
+        transition_initializer: BaseHMMModel.InitializerName = "zeros",
+        emission_initializer: BaseHMMModel.InitializerName = "zeros",
     ):
         self.vocab_size = vocab_size
         self.num_components = num_components
         self.num_states = num_states
         self.device = device
+        self.initial_initializer_name = initial_initializer
+        self.transition_initializer_name = transition_initializer
+        self.emission_initializer_name = emission_initializer
+        self.iterations_run = 0
+        self.final_log_likelihood = None
+        self.fit_time = None
 
         # Mixing weights (log-space logits)
         self.mixing_logits = torch.zeros(num_components, device=device)
@@ -165,6 +175,7 @@ class MixtureHMM:
     def fit(self, data: list[np.array], max_iteration: int, delta_likelyhood: float):
         logger.info(f"Starting EM for MixtureHMM with {self.num_components} components, "
                      f"max {max_iteration} iterations")
+        start_time = time.time()
         prev_ll: float | None = None
         cleaned_data = self.get_cleaned_data(data)
         for iteration in range(int(max_iteration)):
@@ -174,8 +185,13 @@ class MixtureHMM:
             logger.info(f"Iteration {iteration}: log-likelihood = {new_ll:.2f}")
             if prev_ll is not None and abs(new_ll - prev_ll) < delta_likelyhood:
                 logger.info(f"Converged at iteration {iteration}")
+                self.iterations_run = iteration + 1
                 break
             prev_ll = new_ll
+        else:
+            self.iterations_run = int(max_iteration)
+        self.final_log_likelihood = new_ll
+        self.fit_time = time.time() - start_time
 
     def log_likelihood(self, data: list[torch.Tensor]) -> float:
         log_w = self.log_mixing_weights  # [C]
@@ -216,3 +232,24 @@ class MixtureHMM:
         total_ll = self.log_likelihood(cleaned)
         total_tokens = sum(len(seq) for seq in cleaned)
         return np.exp(-total_ll / total_tokens)
+
+    def dump(self) -> None:
+        logger.info("Dumping model and metadata...")
+        random_id = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        model_name = f"m_{random_id}"
+        metadata = {
+            "model_type": self.__class__.__name__,
+            "vocab_size": self.vocab_size,
+            "num_states": self.num_states,
+            "num_components": self.num_components,
+            "device": self.device,
+            "initial_initializer": self.initial_initializer_name,
+            "transition_initializer": self.transition_initializer_name,
+            "emission_initializer": self.emission_initializer_name,
+            "iterations_run": self.iterations_run,
+            "final_log_likelihood": self.final_log_likelihood,
+            "fit_time": self.fit_time,
+        }
+        Path(f'{trained_model_metadata_path}/{model_name}.json').write_text(json.dumps(metadata))
+        with open(f"{trained_model_path}/{model_name}.pkl", "wb") as f:
+            pickle.dump(self, f)

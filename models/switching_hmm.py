@@ -4,10 +4,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from models.base_hmm import BaseHMMModel
-from models.base_initializer import (
-    ZerosInitializer,
-    InitializerType,
-)
 from utils.setup_logger import get_logger
 
 logger = get_logger("switching_hmm")
@@ -36,9 +32,9 @@ class SwitchingHMM(BaseHMMModel):
         num_states: int,
         num_modes: int = 2,
         device: str = "cpu",
-        initial_initializer: InitializerType = ZerosInitializer(),
-        transition_initializer: InitializerType = ZerosInitializer(),
-        emission_initializer: InitializerType = ZerosInitializer(),
+        initial_initializer: BaseHMMModel.InitializerName = "zeros",
+        transition_initializer: BaseHMMModel.InitializerName = "zeros",
+        emission_initializer: BaseHMMModel.InitializerName = "zeros",
     ):
         self.base_states = num_states
         self.num_modes = num_modes
@@ -139,6 +135,12 @@ class SwitchingHMM(BaseHMMModel):
         emiss_sum = torch.exp(self.state_emission_logits).sum(dim=2)
         assert torch.allclose(emiss_sum, torch.ones_like(emiss_sum), atol=1e-4), \
             f"Emission rows do not sum to 1: {emiss_sum}"
+
+    def _get_metadata(self) -> dict:
+        metadata = super()._get_metadata()
+        metadata["num_modes"] = self.num_modes
+        metadata["base_states"] = self.base_states
+        return metadata
 
     # _m_step, fit, _exit_condition, log_likelihood, predict_missing, perplexity
     # all inherited from BaseHMMModel

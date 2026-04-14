@@ -1,37 +1,54 @@
 from sympy import sequence
+from typing import Literal
+import time
 import torch
 import torch.nn.functional as F
-from models.base_initializer import (
-    ZerosInitializer,
-    RandomInitializer,
-    SmallRandomInitializer,
-    InitializerType,
-)
+from models.base_initializer import initializer_mapping
 import numpy as np
 #from pipelines.train import load_config, load_processed_artifacts
 import random
+import string
 from utils.decorators import log_time_and_memory
 from utils.setup_logger import get_logger
+from utils.constants import trained_model_path, trained_model_metadata_path
+import pickle
+from pathlib import Path
+import json
 
 
 logger = get_logger("base_hmm")
 
-
+# TODO switch initializer to type Literal and use initializer_mapping to get the actual initializer instance. This way we can specify initializer by name in config and avoid having to import specific initializers in this file.
+# TODO add training time as a global variable that measures time to train the model and include it in the metadata dump. This way we can track training time across different models and configurations.
 class BaseHMMModel:
+    InitializerName = Literal["zeros", "random", "small_random", "sticky", "sticky_noisy"]
+
     def __init__(
         self,
         vocab_size: int,
         num_states: int,
-        initial_initializer: InitializerType = ZerosInitializer(),
-        transition_initializer: InitializerType = ZerosInitializer(),
-        emission_initializer: InitializerType = ZerosInitializer(),
+        initial_initializer: InitializerName = "zeros",
+        transition_initializer: InitializerName = "zeros",
+        emission_initializer: InitializerName = "zeros",
         device="cpu",
+        max_iteration: int = 5,
+        delta_likelyhood: float = 1e-2
     ):
         self.vocab_size = int(vocab_size)
         self.num_states = int(num_states)
         self.device = device
+        self.max_iteration = max_iteration
+        self.delta_likelyhood = delta_likelyhood
+        self.initial_initializer_name = initial_initializer
+        self.transition_initializer_name = transition_initializer
+        self.emission_initializer_name = emission_initializer
+        self.iterations_run = 0
+        self.final_log_likelihood = None
+        self.fit_time = None
         self.initialize(
-            initial_initializer, transition_initializer, emission_initializer
+            initializer_mapping[initial_initializer],
+            initializer_mapping[transition_initializer],
+            initializer_mapping[emission_initializer],
         )
 
     def initialize(
@@ -166,29 +183,35 @@ class BaseHMMModel:
         self._sanity_check(log_posteriors)
         return log_posteriors
     
-    def _exit_condition(self, iteration: int, prev_log_likelihood: float | None, new_log_likelihood: float, delta_likelyhood: float) -> bool:
+    def _exit_condition(self, iteration: int, prev_log_likelihood: float | None, new_log_likelihood: float) -> bool:
         if prev_log_likelihood is None:
             return False
-        exit =  abs(new_log_likelihood - prev_log_likelihood) < delta_likelyhood
+        exit =  abs(new_log_likelihood - prev_log_likelihood) < self.delta_likelyhood
         if exit:
             logger.info(f"Converged at iteration {iteration} with delta {abs(new_log_likelihood - prev_log_likelihood)}")
         return exit
     
-    def fit(self, data: list[np.array], max_iteration: int, delta_likelyhood: float):
-        logger.info(f"Starting EM training for max {max_iteration} iterations with delta {delta_likelyhood}")
+    def fit(self, data: list[np.array]):
+        logger.info(f"Starting EM training for max {self.max_iteration} iterations with delta {self.delta_likelyhood}")
+        start_time = time.time()
         prev_log_likelihood: float | None = None
         cleaned_data = [
             seq.detach().clone().to(dtype=torch.long, device=self.device) if isinstance(seq, torch.Tensor) 
             else torch.tensor(seq, dtype=torch.long, device=self.device)
             for seq in data
         ]
-        for iteration in range(int(max_iteration)):
+        for iteration in range(int(self.max_iteration)):
             log_posteriors = self._e_step(cleaned_data)
             self._m_step(cleaned_data, log_posteriors)
             new_log_likelihood = self.log_likelihood(cleaned_data)
-            if self._exit_condition(iteration, prev_log_likelihood, new_log_likelihood, delta_likelyhood):
+            if self._exit_condition(iteration, prev_log_likelihood, new_log_likelihood):
+                self.iterations_run = iteration + 1
                 break
             prev_log_likelihood = new_log_likelihood
+        else:
+            self.iterations_run = int(self.max_iteration)
+        self.final_log_likelihood = new_log_likelihood
+        self.fit_time = time.time() - start_time
     
     def emission_logprob_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
         """
@@ -278,6 +301,34 @@ class BaseHMMModel:
         ppl = np.exp(-avg_log_lik)
         return ppl
 
+    def _get_metadata(self) -> dict:
+        return {
+            "model_type": self.__class__.__name__,
+            "vocab_size": self.vocab_size,
+            "num_states": self.num_states,
+            "device": self.device,
+            "initial_initializer": self.initial_initializer_name,
+            "transition_initializer": self.transition_initializer_name,
+            "emission_initializer": self.emission_initializer_name,
+            "iterations_run": self.iterations_run,
+            "final_log_likelihood": self.final_log_likelihood,
+            "fit_time": self.fit_time,
+        }
+
+    def dump(self) -> None:
+        logger.info("Dumping model and metadata...")
+        random_id = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        model_name = f"m_{random_id}"
+        metadata = self._get_metadata()
+
+        Path(f'{trained_model_metadata_path}/{model_name}.json').write_text(json.dumps(metadata))
+
+        with open(f"{trained_model_path}/{model_name}.pkl", "wb") as f:
+            pickle.dump(self, f)
+        
+        
+        
+        
 if __name__ == "__main__":
     pass
     
